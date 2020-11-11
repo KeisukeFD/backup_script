@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import operator
+import os
+import re
+import smtplib
+import subprocess
+import sys
+import time
+from datetime import datetime
+from datetime import timedelta
+from enum import Enum
+from functools import reduce
+from typing import List
+from typing import Optional
+from typing import Tuple
+from typing import Union
+
+import yaml
+from box import Box
+from box import BoxList
+
+
+#####################################################
+#                Class definition                   #
+#####################################################
+class Status(Enum):
+    Success: str = "Success"
+    Failed: str = "Failed"
+
+
+class BackupResult:
+    client_name: str = ""
+    backup_name: str = ""
+    steps: List[str] = []
+    errors: List[Optional[str]] = []
+    success: List[Optional[str]] = []
+    return_codes: List[int] = []
+    time_starts: List[datetime] = []
+    time_ends: List[datetime] = []
+    durations: List[timedelta] = []
+    status: List[Status] = []
+
+    def __init__(self, client_name: str, backup_name: str):
+        self.client_name = client_name
+        self.backup_name = backup_name
+
+    def set(self, step: str, return_code: int, error: Optional[str], success: Optional[str], time_start: datetime, time_end: datetime):
+        self.steps.append(step)
+        self.return_codes.append(return_code)
+        self.errors.append(error)
+        self.success.append(success)
+        self.time_starts.append(time_start)
+        self.time_ends.append(time_end)
+        self.durations.append(time_end - time_start)
+        if return_code != 0 or error:
+            self.status.append(Status.Failed)
+        else:
+            self.status.append(Status.Success)
+
+    def __repr__(self) -> str:
+        return (
+            f"==== Debug ====\n"
+            f"Steps: {self.steps}\n"
+            f"Error: {self.errors}\n"
+            f"Success: {self.success}\n"
+            f"Return Codes: {self.return_codes}\n"
+            f"Starts: {self.time_starts}\n"
+            f"Ends: {self.time_ends}\n"
+            f"Duration: {self.durations}\n"
+            f"Status: {self.status}\n"
+            f"===============\n"
+        )
+
+
+class BackupManager:
+    config: Box
+    result: BackupResult
+
+    def __init__(self, cfg: Box):
+        self.config = cfg
+        self.result = BackupResult(cfg.information.client_name, cfg.backup.name)
+
+    def main(self):
+        err, out, return_code = shell(f"{self.config.binaries.restic} version")
+        if return_code == 127:
+            show("Error: restic command not found !\nPlease check your config file (i.e. binaries.restic field).")
+            exit(-1)
+        elif return_code == 0:
+            match = re.search(r'restic\s(\d+\.\d+\.\d+).*', out) if out else None
+            if match:
+                show(f"Restic version found: {match.group(1)}")
+
+        restic_password = os.environ['RESTIC_PASSWORD'] if 'RESTIC_PASSWORD' in os.environ else None
+        if not restic_password:
+            restic_password = getpass.getpass("Restic Password: ")
+        os.environ['RESTIC_PASSWORD'] = restic_password
+
+        first_launch = cfg.args.first
+        if first_launch:
+            self.init_repository()
+
+        repo_exists = self.is_repository_exists()
+        if repo_exists:
+            start_time = datetime.now()
+            msg = f"Starting backup of '{cfg.backup.name}' on {start_time.strftime('%Y-%m-%d_%H-%M')}"
+            show(msg)
+            self.result.set("banner", 0, None, msg, start_time, start_time)
+
+            self.start_backup()
+            self.start_cleanup()
+            self.check_repo_integrity()
+
+            end_time = datetime.now()
+            show(f"Total duration: {human_duration((end_time - start_time).seconds)}")
+        else:
+            self.result.set("repository_exists", -1, "The repository doesn't exist !", None, datetime.now(), datetime.now())
+
+        if Status.Failed in self.result.status:
+            msg = "Backup failed !"
+        else:
+            msg = "Backup ends successfully !"
+        show(msg)
+
+    def init_repository(self):
+        msg = "Repository initialisation"
+        show(msg)
+
+        start_time = datetime.now()
+        restic_exec = get_value(self.config, "backup.restic_exec")
+        err, out, return_code = shell(f"{restic_exec} init")
+        end_time = datetime.now()
+
+        if return_code == 0 or (err and return_code == 1 and "already initialized" in err):
+            self.result.set(func_name(), 0, None, msg, start_time, end_time)
+        else:
+            self.result.set(func_name(), return_code, err, None, start_time, end_time)
+
+    def is_repository_exists(self) -> bool:
+        show("Checking repository...", end='')
+        restic_exec = self.config.backup.restic_exec
+        err, out, return_code = shell(f"{restic_exec} snapshots --last -c")
+
+        if err and return_code != 0:
+            show("\t[Warning]")
+            show("! Warning !")
+            show(
+                f"The repo '{self.config.args.repo}' is not initialized, please execute the --first flag to solve this issue.")
+            return False
+
+        show("\t[OK]")
+        return True
+
+    def start_backup(self):
+        show("Backup in progress...", end='')
+        restic_exec = self.config.backup.restic_exec
+        exclusion_file = self.config.information.exclusion_file
+        folders = " ".join([f'"{f}"' for f in self.config.args.folders])
+        restic_options = f"--exclude-file={exclusion_file}"
+
+        start_backup_time = datetime.now()
+        err, out, return_code = shell(f"{restic_exec} backup {folders} {restic_options}")
+        end_backup_time = datetime.now()
+
+        # check snapshot id if success
+        # read backup_result and grep snapshot ([0-9a-zA-Z]+) saved
+        snap = re.search(r"snapshot ([0-9a-zA-Z]+) saved", out) if out else None
+        snapshot_id = snap.group(1) if snap else None
+
+        if snapshot_id and return_code == 0:
+            show("\t[OK]")
+            self.result.set(func_name(), return_code, None, out, start_backup_time, end_backup_time)
+        else:
+            show("\t[Error]")
+            self.result.set(func_name(), return_code, err, None, start_backup_time, end_backup_time)
+        show(f"Backup duration: {human_duration((end_backup_time - start_backup_time).seconds)}")
+
+    def start_cleanup(self):
+        show("Cleanup old backups...", end='')
+
+        restic_exec = get_value(self.config, "backup.restic_exec")
+        keep_daily = get_value(self.config, "information.keep_daily")
+        start_cleanup_time = datetime.now()
+        cmd = f"{restic_exec} forget --keep-daily={keep_daily} --prune -c"
+        err, out, return_code = shell(cmd)
+        end_cleanup_time = datetime.now()
+
+        if return_code == 0:
+            show("\t[OK]")
+            self.result.set(func_name(), return_code, None, out, start_cleanup_time, end_cleanup_time)
+        else:
+            show("\t[Error]")
+            self.result.set(func_name(), return_code, err, None, start_cleanup_time, end_cleanup_time)
+        show(f"Cleanup duration: {human_duration((end_cleanup_time - start_cleanup_time).seconds)}")
+
+    def check_repo_integrity(self):
+        show("Checking integrity...", end='')
+
+        restic_exec = get_value(self.config, "backup.restic_exec")
+        start_integrity_time = datetime.now()
+        cmd = f"{restic_exec} check"
+        err, out, return_code = shell(cmd)
+        end_integrity_time = datetime.now()
+
+        res = re.search(r"no errors were found", out) if out else None
+        if res and return_code == 0:
+            show("\t[OK]")
+            self.result.set(func_name(), return_code, None, out, start_integrity_time, end_integrity_time)
+        else:
+            show("\t[Error]")
+            self.result.set(func_name(), return_code, err, None, start_integrity_time, end_integrity_time)
+        show(f"Integrity duration: {human_duration((end_integrity_time - start_integrity_time).seconds)}")
+
+    def make_and_send_email(self):
+        show("Sending email...", end="")
+        status = Status.Failed if Status.Failed in self.result.status else Status.Success
+        subject = f"[{status}] Backup '{self.config.backup.name}' - {datetime.strftime(self.result.time_starts[0], '%Y-%m-%d %H:%M')}'"
+        body = f"Subject: {subject}\n\n"
+        for i in range(0, len(self.result.status)):
+            body += f"==== {self.result.steps[i]} ====\n"
+            if self.result.status[i] == Status.Success:
+                body += f"{self.result.success[i]}\n"
+            else:
+                body += f"{self.result.errors[i]}\n"
+
+            body += f"==> Duration: {human_duration(self.result.durations[i].seconds)}\n"
+        total_duration = self.result.durations[-1].seconds - self.result.durations[0].seconds
+        body += f"\nTotal Duration: {human_duration(total_duration)}"
+
+        count = 0
+        for i in range(0, int(self.config.email.max_try)):
+            count += 1
+            try:
+                show(f"{i + 1} ", end="")
+                with smtplib.SMTP(self.config.email.host, int(self.config.email.port)) as server:
+                    server.sendmail(self.config.email.sender, self.config.email.to, body)
+                    show("\t[OK]")
+                    break
+            except Exception:
+                pass
+            time.sleep(int(self.config.timeout))
+
+        if count >= int(self.config.email.max_try):
+            show("\t[Error]")
+
+
+#####################################################
+#                Utilities / Consts                 #
+#####################################################
+ShellReturn = Tuple[Optional[str], Optional[str], int]
+
+
+def shell(command: str) -> ShellReturn:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    stdout, stderr = process.communicate()
+    return (
+        stderr.decode("utf8") if stderr else None,
+        stdout.decode("utf8") if stdout else None,
+        process.returncode
+    )
+
+
+def shell_in(folder: str, command: str) -> ShellReturn:
+    new_command = "cd {} && {}".format(folder, command)
+    return shell(new_command)
+
+
+def load_config(filename: str) -> Box:
+    with open(filename, 'r') as ymlfile:
+        cfg = yaml.load(ymlfile, Loader=yaml.FullLoader)
+    return Box(cfg, box_it_up=True)
+
+
+def get_by_path(data: Box, path_str: str) -> Union[Box, BoxList]:
+    """ Access a nested object in data by pathStr sequence separated by dot (.)) """
+    return reduce(operator.getitem, [i for i in path_str.split('.')], data)
+
+
+def set_by_path(data: Box, path_str: str, value: Union[str, int, bool]):
+    """ Set a nested object in data by pathStr sequence separated by dot (.)) """
+    obj = reduce(operator.getitem, [i for i in path_str.split('.')][:-1], data)
+    obj[path_str.split('.')[-1]] = value
+
+
+def _is_reference(val: str) -> bool:
+    return val.startswith('${') and val.endswith('}')
+
+
+def get_value(obj: Box, path: str, index: Optional[int] = None):
+    value: Union[str, List[str]]
+    tmp = get_by_path(obj, path)
+    if isinstance(tmp, Box):
+        value = str(tmp)
+        if value.startswith('{'):
+            value = tmp
+    elif isinstance(tmp, BoxList) and index is None:
+        value = [get_value(obj, item[2:-1]) if _is_reference(item) else item for item in tmp.to_list()]
+    elif isinstance(tmp, BoxList):
+        value = tmp.to_list()[index]
+    else:
+        value = tmp
+
+    if isinstance(value, str) and _is_reference(value):
+        return get_value(obj, value[2:-1])
+    if value or value == "":
+        return value
+    elif type(value) is bool:
+        return value
+    else:
+        raise Exception("Error on field: '{}'".format(path))
+
+
+def human_duration(seconds: int) -> str:
+    """
+        Get the duration as formatted string value from seconds.
+
+        :param seconds: number of seconds to convert
+        :type seconds: int
+        :return: formatted value (ex. 1h 34m 22s)
+        :rtype: str
+
+        :Example:
+        >>> human_duration(123)
+        '2m 3s'
+        >>> human_duration(198782)
+        '2j 7h 13m'
+    """
+    seconds_in_day = 60 * 60 * 24
+    seconds_in_hour = 60 * 60
+    seconds_in_minute = 60
+
+    days = seconds // seconds_in_day
+    hours = (seconds - (days * seconds_in_day)) // seconds_in_hour
+    minutes = (seconds - (days * seconds_in_day) - (hours * seconds_in_hour)) // seconds_in_minute
+    remain_seconds = (seconds - (days * seconds_in_day) - (hours * seconds_in_hour) - (minutes * seconds_in_minute))
+
+    if days:
+        msg = f"{days}j {hours}h {minutes}m"
+    elif hours:
+        msg = f"{hours}h {minutes}m {remain_seconds}s"
+    elif minutes:
+        msg = f"{minutes}m {remain_seconds}s"
+    else:
+        msg = f"{remain_seconds}s"
+    return msg
+
+
+def func_name() -> str:
+    """
+        Get the current function name
+        :return: the function name as string
+        :rtype: str
+    """
+    return sys._getframe(1).f_code.co_name
+
+
+def show(value: str, end: str = '\n', display: bool = True):
+    if display:
+        sys.stdout.write(f'{value}{end}')
+        sys.stdout.flush()
+
+
+def checking_required_config(config: Box):
+    to_defined = [r for r in REQUIRED_CONFIG_FIELDS if not get_value(config, r)]
+    if to_defined:
+        print("You must defined the following configuration in the config file.")
+        print("\n".join([f"- {t}" for t in to_defined]))
+        exit(-1)
+
+
+def merge_configuration(default_cfg: Box, cfg: Box) -> Box:
+    new_cfg = Box(cfg.copy())
+    for dcf in DEFAULT_CONFIG_FIELDS:
+        if not get_value(new_cfg, dcf):
+            set_by_path(new_cfg, dcf, get_value(default_cfg, dcf))
+
+    backup_name = f"{get_value(new_cfg, 'information.client_name')}/{get_value(new_cfg, 'information.server_name')}/{get_value(new_cfg, 'args.repo')}"
+    repository = f"rclone:{get_value(new_cfg, 'information.rclone_connection_name')}:{get_value(new_cfg, 'information.bucket_name')}/{backup_name}"
+    new_cfg.backup = Box({
+        'name': backup_name,
+        'repository': repository,
+        'restic_exec': f"{get_value(new_cfg, 'binaries.restic')} -r {repository}"
+    })
+    return new_cfg
+
+
+# Default Yaml Configuration
+YAML_DEFAULT_CONFIG = """
+information:
+    client_name: ""
+    server_name: ""
+    rclone_connection_name: ""
+    bucket_name: ""
+    exclusion_file: "exclude-files"
+    keep_daily: "90"
+
+binaries:
+    restic: "/usr/bin/restic"
+
+email:
+    enable: false
+    from: "backup@local.dev"
+    to: "admin@local.dev"
+    host: "localhost"
+    port: "1025"
+    max_try: "5"
+    timeout: "60"
+"""
+# Otherwise default config will be filled in
+REQUIRED_CONFIG_FIELDS = [
+    'information.client_name',
+    'information.server_name',
+    'information.rclone_connection_name',
+    'information.bucket_name'
+]
+# default config field to be replaced by default value if missing
+DEFAULT_CONFIG_FIELDS = [
+    'information.exclusion_file',
+    'information.keep_daily',
+    'binaries.restic',
+    'email.enable',
+    'email.sender',
+    'email.to',
+    'email.host',
+    'email.port',
+    'email.max_try',
+    'email.timeout'
+]
+
+
+#####################################################
+#                 Start Program                     #
+#####################################################
+def argument_parsing() -> argparse.Namespace:
+    """ Parse arguments from command line
+    :return Object of all arguments
+    """
+    parser = argparse.ArgumentParser(description="Take backup with restic")
+    parser.add_argument('-r', '--repo', help='Restic repository name', required=True)
+    parser.add_argument('-f', '--first', help='First initialisation for the repository restic', action='store_true')
+    parser.add_argument('-c', '--config', help='Configuration file (default: config.yml)', default="config.yml")
+    parser.add_argument('-l', '--log', help='Log file (default: backup_YYYY-MM-dd.log)', default='backup_YYYY-MM-dd.log')
+    parser.add_argument('folders', help='List of files or folders to backup', nargs='+')
+    return parser.parse_args()
+
+
+def check_backup_folders(folders: List[str], display: bool = True):
+    """ Check if file or folders passed in parameters exists.
+    :param folders List of file and folders as string
+    :param display Allow the user to show the output or not
+    """
+    show("Files or folders to backup:", display=display)
+    not_found = False
+    for f in folders:
+        show(f"- {f}", end="", display=display)
+        if os.path.exists(f):
+            show("\t[OK]", display=display)
+        else:
+            show("\t[Not found]", display=display)
+            not_found = True
+    if not_found:
+        show("Please verify your backup folders", display=display)
+        exit(-1)
+
+
+if __name__ == '__main__':
+    args = argument_parsing()
+    loaded_cfg = load_config(args.config)
+
+    # Set arguments into the config
+    loaded_cfg.args = Box()
+    loaded_cfg.args.repo = args.repo
+    loaded_cfg.args.first = args.first
+    loaded_cfg.args.log = args.log
+    loaded_cfg.args.folders = args.folders
+
+    # Default configuration
+    yml_config = yaml.safe_load(YAML_DEFAULT_CONFIG)
+    default_cfg = Box(yml_config, box_it_up=True)
+    # Checking variables or set to default
+    checking_required_config(loaded_cfg)
+    cfg = merge_configuration(default_cfg, loaded_cfg)
+
+    check_backup_folders(cfg.args.folders)
+    bm = BackupManager(cfg)
+    bm.main()
+    if cfg.email.enable:
+        bm.make_and_send_email()
