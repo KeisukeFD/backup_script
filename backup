@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import getpass
+import logging
 import operator
 import os
 import re
@@ -58,6 +59,11 @@ class BackupResult:
             self.status.append(Status.Failed)
         else:
             self.status.append(Status.Success)
+
+        if error:
+            logging.error(error)
+        if success:
+            logging.debug(success)
 
     def __repr__(self) -> str:
         return (
@@ -239,7 +245,7 @@ class BackupManager:
                     break
             except Exception:
                 pass
-            time.sleep(int(self.config.timeout))
+            time.sleep(int(self.config.email.timeout))
 
         if count >= int(self.config.email.max_try):
             show("\t[Error]")
@@ -359,13 +365,16 @@ def show(value: str, end: str = '\n', display: bool = True):
     if display:
         sys.stdout.write(f'{value}{end}')
         sys.stdout.flush()
+        logging.info(value)
+    else:
+        logging.debug(value)
 
 
 def checking_required_config(config: Box):
     to_defined = [r for r in REQUIRED_CONFIG_FIELDS if not get_value(config, r)]
     if to_defined:
-        print("You must defined the following configuration in the config file.")
-        print("\n".join([f"- {t}" for t in to_defined]))
+        show("You must defined the following configuration in the config file.")
+        show("\n".join([f"- {t}" for t in to_defined]))
         exit(-1)
 
 
@@ -440,7 +449,7 @@ def argument_parsing() -> argparse.Namespace:
     parser.add_argument('-r', '--repo', help='Restic repository name', required=True)
     parser.add_argument('-f', '--first', help='First initialisation for the repository restic', action='store_true')
     parser.add_argument('-c', '--config', help='Configuration file (default: config.yml)', default="config.yml")
-    parser.add_argument('-l', '--log', help='Log file (default: backup_YYYY-MM-dd.log)', default='backup_YYYY-MM-dd.log')
+    parser.add_argument('-l', '--log', help='Log file (default: backup_YYYY-MM-dd_H-m.log)')
     parser.add_argument('folders', help='List of files or folders to backup', nargs='+')
     return parser.parse_args()
 
@@ -467,6 +476,9 @@ def check_backup_folders(folders: List[str], display: bool = True):
 if __name__ == '__main__':
     args = argument_parsing()
     loaded_cfg = load_config(args.config)
+
+    log_filename = args.log if args.log else f"backup_{datetime.strftime(datetime.now(), '%Y-%m-%d_%H-%M')}.log"
+    logging.basicConfig(filename=log_filename, level=logging.DEBUG, format='%(asctime)s: [%(levelname)s] %(message)s')
 
     # Set arguments into the config
     loaded_cfg.args = Box()
