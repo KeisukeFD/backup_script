@@ -3,6 +3,8 @@ __pycache__/
 .mypy_cache/
 *.py[cod]
 
+config.yml
+
 # Distribution / packaging
 .Python
 build/
