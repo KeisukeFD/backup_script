@@ -384,7 +384,8 @@ def merge_configuration(default_cfg: Box, cfg: Box) -> Box:
         if not get_value(new_cfg, dcf):
             set_by_path(new_cfg, dcf, get_value(default_cfg, dcf))
 
-    backup_name = f"{get_value(new_cfg, 'information.client_name')}/{get_value(new_cfg, 'information.server_name')}/{get_value(new_cfg, 'args.repo')}"
+    backup_name = f"{get_value(new_cfg, 'information.client_name') or ''}/{get_value(new_cfg, 'information.server_name') or ''}/{get_value(new_cfg, 'args.repo')}"
+    backup_name = re.sub(r'(/+){2}', '/', backup_name)
     repository = f"rclone:{get_value(new_cfg, 'information.rclone_connection_name')}:{get_value(new_cfg, 'information.bucket_name')}/{backup_name}"
     new_cfg.backup = Box({
         'name': backup_name,

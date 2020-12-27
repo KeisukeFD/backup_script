@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import re
 import subprocess
 
 import yaml
@@ -28,10 +29,11 @@ if __name__ == '__main__':
     config = load_config(args.config)
 
     restic_cmd = (
-        fr"{config.binaries.restic} "
-        fr"-r rclone:{config.information.rclone_connection_name}:{config.information.bucket_name}/"
-        fr"{config.information.client_name}/{config.information.server_name}/{args.repo}"
+        f"{config.binaries.restic} "
+        f"-r rclone:{config.information.rclone_connection_name}:{config.information.bucket_name}/"
+        f"{config.information.client_name or ''}/{config.information.server_name or ''}/{args.repo}"
     )
+    restic_cmd = re.sub(r'(/+){2}', '/', restic_cmd)
 
     params = ' '.join(args.restic_params)
     if others:

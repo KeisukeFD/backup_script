@@ -24,6 +24,8 @@ _The project is not maintained, but feel free to contribute and improve it !_
 
 ## Installations
 ```bash
+$ git clone git@github.com:KeisukeFD/backup_script.git /home/scripts/backup
+$ cd /home/scripts/backup
 $ virtualenv -p $(which python3) venv
 $ source venv/bin/activate
 $ pip install -r requirements.txt
@@ -50,7 +52,7 @@ $ curl https://rclone.org/install.sh | bash
 $ mkdir -p /home/scripts
 
 # Get this repo
-$ git clone git@github.com/keisukekfd/backup_script.git /home/scripts/backup
+$ git clone git@github.com:KeisukeFD/backup_script.git /home/scripts/backup
 ```
 
 ## Configuration
